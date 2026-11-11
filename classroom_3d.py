@@ -5,13 +5,45 @@ NeuroCheat 3D 第一人稱教室與書桌抽屜建模引擎 (Classroom 3D Perspe
 2. 3D 教室空間建模：立體地板磁磚、左右牆面與窗戶、天花板燈具、黑板、講台、蜂鳴器
 3. 旁邊的其他學生 (3D 鄰座考生建模：左右鄰座、前排左右與正前方同學，具備寫考卷、抓頭、轉頭動態)
 4. 玩家書桌與抽屜建模：
-   - 玩家坐在書桌前，考卷平鋪在書桌桌面上 (隨 3D 視角透視投影，可直接點擊桌面考卷作答)
-   - 小抄藏在書桌下方的立體抽屜裡
-   - 打開小抄時，玩家會伸手拉開抽屜並展開抽屜裡的小抄；收起時手會將小抄合上並推回抽屜
+   - 玩家坐在書桌前，考卷與考卷上的所有文字/選項真正透過 3D 透視投影平貼在書桌平面上 (3D Planar Perspective Projection)，完整換行絕不截斷！
+   - 小抄藏在書桌下方的立體抽屜裡，打開小抄時會伸手拉開抽屜並展開小抄
 """
 
 import math
+import numpy as np
+from PIL import Image
 import pygame
+
+
+def find_perspective_coeffs(dst_pts, src_pts):
+    """
+    計算 8 參數透視變換矩陣係數 (供 PIL.Image.transform 將平面考卷材質貼合至 3D 書桌平面四邊形)
+    同時可用於將螢幕滑鼠座標 (x, y) 逆投影回考卷平面座標 (u, v)
+    """
+    matrix = []
+    target = []
+    for (x, y), (u, v) in zip(dst_pts, src_pts):
+        matrix.append([x, y, 1, 0, 0, 0, -x * u, -y * u])
+        matrix.append([0, 0, 0, x, y, 1, -x * v, -y * v])
+        target.append(u)
+        target.append(v)
+    A = np.array(matrix, dtype=np.float64)
+    B = np.array(target, dtype=np.float64)
+    try:
+        res = np.linalg.solve(A, B)
+        return res.tolist()
+    except Exception:
+        return None
+
+
+def map_point_with_coeffs(coeffs, x, y):
+    """使用透視係數將螢幕局部座標 (x, y) 映射回考卷平面座標 (u, v)"""
+    denom = coeffs[6] * x + coeffs[7] * y + 1.0
+    if abs(denom) < 1e-6:
+        return (-1.0, -1.0)
+    u = (coeffs[0] * x + coeffs[1] * y + coeffs[2]) / denom
+    v = (coeffs[3] * x + coeffs[4] * y + coeffs[5]) / denom
+    return (u, v)
 
 
 class Camera3D:
@@ -19,15 +51,14 @@ class Camera3D:
         self.width = width
         self.height = height
         # 玩家坐在書桌前的眼睛 3D 座標 (單位: 公尺)
-        # x=0 為教室中央座位, y=1.34 為坐姿眼睛高度, z=-0.42 為坐在椅子上的位置
-        self.pos = [0.0, 1.34, -0.42]
+        self.pos = [0.0, 1.44, -0.38]
         # 視角角度 (弧度):
         # yaw > 0 為向右轉頭, yaw < 0 為向左轉頭
         # pitch > 0 為抬頭看黑板, pitch < 0 為低頭看書桌考卷與抽屜
         self.yaw = 0.0
-        self.pitch = -0.24
+        self.pitch = -0.30
         self.target_yaw = 0.0
-        self.target_pitch = -0.24
+        self.target_pitch = -0.30
         self.fov_scale = 680.0
 
     def update_from_mouse(self, mouse_pos, dt, hud_rect=None):
@@ -36,43 +67,35 @@ class Camera3D:
         view_w = self.width - 385  # 左側 3D 視窗寬度
 
         if hud_rect and hud_rect.collidepoint(mx, my):
-            # 滑鼠在右側儀表板操作時，保持面向正前方書桌與黑板，方便專心調控
             self.target_yaw = 0.0
-            self.target_pitch = -0.22
+            self.target_pitch = -0.28
         else:
             norm_x = (mx / max(1, view_w)) * 2.0 - 1.0
             norm_y = (my / max(1, self.height)) * 2.0 - 1.0
             norm_x = max(-1.0, min(1.0, norm_x))
             norm_y = max(-1.0, min(1.0, norm_y))
 
-            # 左右轉頭：-45 度 ~ +45 度 (清楚看到左右兩側其他學生與教室窗戶/門)
             self.target_yaw = norm_x * 0.72
-            # 上下俯仰：滑鼠往上 (norm_y=-1) -> pitch=+0.08 (抬頭看黑板奶龍)
-            #           滑鼠置中 (norm_y=0)  -> pitch=-0.22 (同時看到前方奶龍與桌上考卷)
-            #           滑鼠往下 (norm_y=+1) -> pitch=-0.52 (低頭直視書桌考卷與拉開的抽屜內部小抄)
-            self.target_pitch = -norm_y * 0.30 - 0.22
+            self.target_pitch = -norm_y * 0.32 - 0.28
 
         self.target_yaw = max(-0.85, min(0.85, self.target_yaw))
-        self.target_pitch = max(-0.56, min(0.12, self.target_pitch))
+        self.target_pitch = max(-0.64, min(0.12, self.target_pitch))
 
         smooth = min(1.0, dt * 10.0)
         self.yaw += (self.target_yaw - self.yaw) * smooth
         self.pitch += (self.target_pitch - self.pitch) * smooth
 
     def world_to_cam(self, pt):
-        """將世界座標 (x, y, z) 轉換為相機空間座標 (cx, cy, cz)"""
         dx = pt[0] - self.pos[0]
         dy = pt[1] - self.pos[1]
         dz = pt[2] - self.pos[2]
 
-        # 1. 繞 Y 軸水平轉頭 (yaw > 0 向右看)
         cos_y = math.cos(self.yaw)
         sin_y = math.sin(self.yaw)
         x1 = dx * cos_y - dz * sin_y
         z1 = dx * sin_y + dz * cos_y
         y1 = dy
 
-        # 2. 繞 X 軸垂直俯仰 (pitch < 0 低頭往下看書桌與抽屜)
         cos_p = math.cos(self.pitch)
         sin_p = math.sin(self.pitch)
         y2 = y1 * cos_p - z1 * sin_p
@@ -82,7 +105,6 @@ class Camera3D:
         return (x2, y2, z2)
 
     def project(self, pt):
-        """將世界座標投影為 2D 螢幕座標 (sx, sy, cz)"""
         cx, cy, cz = self.world_to_cam(pt)
         if cz < 0.18:
             return None
@@ -93,7 +115,6 @@ class Camera3D:
         return (int(sx), int(sy), cz)
 
     def clip_and_project_poly(self, pts_3d):
-        """對 3D 多邊形進行近平面 (z = 0.20) 裁剪並投影至 2D 螢幕頂點列表"""
         near_z = 0.20
         cam_pts = [self.world_to_cam(p) for p in pts_3d]
 
@@ -136,24 +157,44 @@ class Camera3D:
 
 
 class Classroom3DRenderer:
-    """負責繪製 3D 教室場景、旁邊其他學生、奶龍監考官、玩家書桌、桌下抽屜與伸手翻小抄動畫"""
+    """負責繪製 3D 教室場景、旁邊其他學生、奶龍監考官、3D 平面貼合考卷、桌下抽屜與伸手翻小抄動畫"""
 
     def __init__(self, width, height):
         self.width = width
         self.height = height
         self.camera = Camera3D(width, height)
 
-        # 教室中旁邊與前排的其他學生座位配置 (中央保留走道讓奶龍巡邏，左右兩側與前排坐滿同學)
+        # 考卷平面材質解析度 (寬 740 x 高 480，確保任何長度的題目與選項都能完整排版不截斷)
+        self.TEX_W = 740
+        self.TEX_H = 480
+        self.paper_tex = pygame.Surface((self.TEX_W, self.TEX_H), pygame.SRCALPHA)
+
+        font_path = pygame.font.match_font("microsoftjhenghei") or pygame.font.match_font("simsun")
+        try:
+            self.font_paper_q = pygame.font.Font(font_path, 25)
+            self.font_paper_q.set_bold(True)
+            self.font_paper_opt = pygame.font.Font(font_path, 23)
+            self.font_paper_opt.set_bold(True)
+        except Exception:
+            self.font_paper_q = None
+            self.font_paper_opt = None
+
+        # 定義在考卷平面 (740 x 480) 上的固定按鈕區域
+        self.tex_btn_prev = pygame.Rect(380, 12, 105, 36)
+        self.tex_btn_next = pygame.Rect(495, 12, 105, 36)
+        self.tex_btn_submit = pygame.Rect(610, 12, 112, 36)
+        self.tex_btn_options = [
+            pygame.Rect(24, 198 + i * 67, self.TEX_W - 48, 57) for i in range(4)
+        ]
+
+        # 教室中旁邊與前排的其他學生座位配置
         self.classmates = [
-            # 玩家左右兩側鄰座同學 (轉頭即可清楚看到)
             {"x": -1.48, "z": 0.48, "coat": (46, 115, 86),  "hair": (28, 24, 22), "type": "write_fast", "name": "左鄰座同學：阿明 (埋頭狂寫)"},
             {"x":  1.48, "z": 0.48, "coat": (70, 82, 118),  "hair": (42, 30, 24), "type": "scratch",    "name": "右鄰座同學：小華 (苦思抓頭)"},
-            # 中排走道兩側同學
-            {"x": -2.15, "z": 2.35, "coat": (140, 68, 65),  "hair": (25, 22, 20), "type": "look_around","name": "左前外侧同學"},
+            {"x": -2.15, "z": 2.35, "coat": (140, 68, 65),  "hair": (25, 22, 20), "type": "look_around","name": "左前外側同學"},
             {"x": -0.92, "z": 2.45, "coat": (62, 95, 130),  "hair": (35, 28, 22), "type": "write_fast", "name": "左前走道旁同學"},
             {"x":  0.92, "z": 2.45, "coat": (122, 98, 65),  "hair": (30, 25, 20), "type": "nod",        "name": "右前走道旁同學"},
             {"x":  2.15, "z": 2.35, "coat": (85, 110, 90),  "hair": (26, 22, 18), "type": "write_fast", "name": "右前外側同學"},
-            # 第一排同學 (靠近講台黑板)
             {"x": -1.35, "z": 4.30, "coat": (55, 90, 100),  "hair": (22, 20, 18), "type": "write_fast", "name": "第一排左同學"},
             {"x":  1.35, "z": 4.30, "coat": (95, 72, 102),  "hair": (38, 28, 22), "type": "scratch",    "name": "第一排右同學"},
         ]
@@ -231,7 +272,7 @@ class Classroom3DRenderer:
         self.draw_poly3d(surface, [(rm_x2 - 0.02, 0.0, 5.0), (rm_x2 - 0.02, 0.0, 6.2), (rm_x2 - 0.02, 2.25, 6.2), (rm_x2 - 0.02, 2.25, 5.0)], (135, 92, 58), (90, 58, 32), 2)
         self.draw_poly3d(surface, [(rm_x2 - 0.02, 1.05, 1.0), (rm_x2 - 0.02, 1.05, 3.5), (rm_x2 - 0.02, 2.30, 3.5), (rm_x2 - 0.02, 2.30, 1.0)], (65, 105, 85), (130, 95, 60), 3)
 
-        # 5. 前方講台牆面与大黑板
+        # 5. 前方講台牆面與大黑板
         front_wall = [(rm_x1, rm_y1, rm_z2), (rm_x2, rm_y1, rm_z2), (rm_x2, rm_y2, rm_z2), (rm_x1, rm_y2, rm_z2)]
         self.draw_poly3d(surface, front_wall, (224, 230, 236), (185, 192, 200), 2)
 
@@ -265,7 +306,6 @@ class Classroom3DRenderer:
 
         polys = []
 
-        # 學生木書桌
         dx1, dx2 = x - 0.44, x + 0.44
         dz1, dz2 = z + 0.08, z + 0.62
         dy = 0.74
@@ -275,7 +315,6 @@ class Classroom3DRenderer:
         polys.append(([(dx1, 0.55, dz2), (dx2, 0.55, dz2), (dx2, dy, dz2), (dx1, dy, dz2)], (152, 118, 84), (105, 78, 52)))
         polys.append(([(dx1, dy, dz1), (dx2, dy, dz1), (dx2, dy, dz2), (dx1, dy, dz2)], (188, 148, 106), (130, 95, 62)))
 
-        # 鄰座桌上的白色考卷
         px1, px2 = x - 0.22, x + 0.22
         pz1, pz2 = z + 0.16, z + 0.50
         polys.append(([(px1, dy + 0.01, pz1), (px2, dy + 0.01, pz1), (px2, dy + 0.01, pz2), (px1, dy + 0.01, pz2)], (248, 248, 242), (200, 200, 195)))
@@ -291,10 +330,8 @@ class Classroom3DRenderer:
         elif atype == "look_around":
             head_yaw_off = math.sin(ticks * 0.003 + z) * 0.07
 
-        # 椅背
         polys.append(([(x - 0.22, 0.35, z - 0.18), (x + 0.22, 0.35, z - 0.18), (x + 0.22, 0.82, z - 0.18), (x - 0.22, 0.82, z - 0.18)], (95, 70, 48), (70, 50, 32)))
 
-        # 學生軀幹
         tx1, tx2 = x - 0.21, x + 0.21
         tz1, tz2 = z - 0.12, z + 0.12
         ty1, ty2 = 0.50, 1.06
@@ -305,7 +342,6 @@ class Classroom3DRenderer:
         polys.append(([(tx2, ty1, tz1), (tx2, ty1, tz2), (tx2, ty2, tz2), (tx2, ty2, tz1)], coat_dark, None))
         polys.append(([(tx1, ty2, tz1), (tx2, ty2, tz1), (tx2, ty2, tz2), (tx1, ty2, tz2)], coat, None))
 
-        # 伸到桌上寫考卷的手臂
         arm_x = x + 0.15 + hand_x_off
         polys.append(([(x + 0.13, 0.76, z + 0.06), (x + 0.23, 0.76, z + 0.06), (arm_x + 0.05, 0.76, z + 0.34), (arm_x - 0.05, 0.76, z + 0.34)], coat, coat_dark))
 
@@ -320,7 +356,6 @@ class Classroom3DRenderer:
             reverse=True
         )
 
-        # 奶龍在 3D 教室中的座標 (z=6.2 在黑板前 -> 巡邏時走到玩家書桌前 z=1.25)
         t_z = 6.20 - teacher.patrol_progress * 4.95
         waddle_x = math.sin(ticks * 0.012) * 0.14 * teacher.patrol_progress if teacher.state == "PATROLLING" else 0.0
         t_x = waddle_x
@@ -420,194 +455,230 @@ class Classroom3DRenderer:
         pygame.draw.rect(surface, (245, 200, 70), tag_r, 1, border_radius=4)
         surface.blit(lbl, (tag_r.x + 8, tag_r.y + 2))
 
-    def render_player_desk_and_drawer(self, surface, exam, bio, mouse_pos, fonts, anim_helper):
+    def _render_exam_paper_texture(self, exam, tex_mouse_uv, fonts, anim_helper):
         """
-        繪製玩家正前方的 3D 書桌、桌上的考卷、書桌下的立體抽屜、
-        以及「小抄在抽屜裡，打開小抄時會伸手拉開抽屜並打開小抄」的完整互動建模！
+        先在 740x480 的高解析度標準考卷平面材質上繪製完整考題與選項 (保證不截斷、不超出紙張)，
+        隨後再透過 3D 透視變換將整張考卷貼合到書桌的 3D 平面上！
         """
         font_small, font_main, font_bold = fonts
-        lift = bio.emg_signal_level  # 0.0 (抽屜收起) -> 1.0 (伸手拉開抽屜並攤開小抄)
+        self.paper_tex.fill((252, 250, 242, 255))
+        pygame.draw.rect(self.paper_tex, (190, 185, 175, 255), (0, 0, self.TEX_W, self.TEX_H), 4)
+        pygame.draw.line(self.paper_tex, (215, 210, 200, 255), (20, 56), (self.TEX_W - 20, 56), 2)
 
-        # ==================== A. 書桌桌面與桌腳建模 (Player's Desk Top) ====================
-        desk_x1, desk_x2 = -0.64, 0.64
-        desk_y = 0.78
-        desk_z_near = 0.36
-        desk_z_far = 1.02
+        q = exam.current_question()
+        fq = self.font_paper_q or font_bold
+        fopt = self.font_paper_opt or font_bold
 
-        # 書桌左右桌腳與深色抽屜箱體外殼
-        self.draw_poly3d(surface, [
-            (desk_x1 + 0.02, 0.45, desk_z_near),
-            (desk_x2 - 0.02, 0.45, desk_z_near),
-            (desk_x2 - 0.02, desk_y, desk_z_near),
-            (desk_x1 + 0.02, desk_y, desk_z_near),
-        ], (105, 74, 48), (75, 52, 32), 2)
+        # 1. 考卷頂部抬頭與題號
+        head_s = fq.render(f"【期末考卷】第 {exam.current_idx + 1} / {len(exam.questions)} 題", True, (30, 110, 175))
+        self.paper_tex.blit(head_s, (22, 14))
 
-        # 書桌木質主桌面
-        self.draw_poly3d(surface, [
-            (desk_x1, desk_y, desk_z_near),
-            (desk_x2, desk_y, desk_z_near),
-            (desk_x2, desk_y, desk_z_far),
-            (desk_x1, desk_y, desk_z_far),
-        ], (196, 152, 106), (132, 96, 62), 3)
+        # 2. 考卷右上角導航與提早交卷按鈕
+        u_m, v_m = tex_mouse_uv
+        for r_btn, lbl, en, b_n in [
+            (self.tex_btn_prev, "< 上一題", exam.current_idx > 0, "PREV"),
+            (self.tex_btn_next, "下一題 >", exam.current_idx < len(exam.questions) - 1, "NEXT"),
+        ]:
+            d_b, is_p = anim_helper(r_btn, b_n)
+            is_hov = r_btn.collidepoint(u_m, v_m) and en
+            bg_c = (210, 228, 248) if is_hov else ((232, 238, 246) if en else (238, 238, 238))
+            pygame.draw.rect(self.paper_tex, bg_c, d_b, border_radius=6)
+            pygame.draw.rect(self.paper_tex, (255, 200, 0) if is_p else (160, 170, 185), d_b, 2 if is_p else 1, border_radius=6)
+            ls = font_main.render(lbl, True, (25, 25, 25) if en else (160, 160, 160))
+            self.paper_tex.blit(ls, (d_b.centerx - ls.get_width() // 2, d_b.centery - ls.get_height() // 2))
 
-        # 桌面立體前緣木條
-        self.draw_poly3d(surface, [
-            (desk_x1, desk_y - 0.03, desk_z_near),
-            (desk_x2, desk_y - 0.03, desk_z_near),
-            (desk_x2, desk_y, desk_z_near),
-            (desk_x1, desk_y, desk_z_near),
-        ], (152, 110, 72), (105, 74, 48), 2)
+        sub_b, sub_p = anim_helper(self.tex_btn_submit, "SUBMIT")
+        sub_hov = self.tex_btn_submit.collidepoint(u_m, v_m)
+        pygame.draw.rect(self.paper_tex, (52, 218, 122) if sub_hov else (46, 204, 113), sub_b, border_radius=6)
+        pygame.draw.rect(self.paper_tex, (255, 230, 80) if sub_p else (35, 160, 85), sub_b, 2 if sub_p else 1, border_radius=6)
+        ls_sub = font_main.render("★ 提早交卷", True, (255, 255, 255))
+        self.paper_tex.blit(ls_sub, (sub_b.centerx - ls_sub.get_width() // 2, sub_b.centery - ls_sub.get_height() // 2))
 
-        # 書桌右上角的原子筆與橡皮擦
-        self.draw_poly3d(surface, [
-            (0.45, desk_y + 0.005, 0.46),
-            (0.47, desk_y + 0.005, 0.46),
-            (0.51, desk_y + 0.005, 0.76),
-            (0.49, desk_y + 0.005, 0.76),
-        ], (45, 95, 185), (25, 55, 120), 1)
-        self.draw_poly3d(surface, [
-            (0.48, desk_y + 0.005, 0.39),
-            (0.55, desk_y + 0.005, 0.39),
-            (0.55, desk_y + 0.005, 0.44),
-            (0.48, desk_y + 0.005, 0.44),
-        ], (245, 245, 250), (160, 165, 175), 1)
+        # 3. 完整顯示題幹文字 (支援多行完整換行，絕不截斷！)
+        prompt_lines = self._wrap_text(q.prompt, fq, self.TEX_W - 48)
+        curr_y = 64
+        for ln in prompt_lines:
+            ln_s = fq.render(ln, True, (15, 15, 15))
+            self.paper_tex.blit(ln_s, (24, curr_y))
+            curr_y += 36
 
-        # ==================== B. 書桌上的考卷 (Exam Paper on Desk) ====================
-        paper_3d = [
-            (-0.42, desk_y + 0.006, 0.39),
-            ( 0.40, desk_y + 0.006, 0.39),
-            ( 0.40, desk_y + 0.006, 0.96),
-            (-0.42, desk_y + 0.006, 0.96),
-        ]
-        paper_pts = self.draw_poly3d(surface, paper_3d, (252, 250, 242), (200, 195, 185), 2)
+        # 4. 四個作答選項 A, B, C, D (完整顯示在考卷平面內)
+        for i, opt in enumerate(q.options):
+            raw_r = self.tex_btn_options[i]
+            b_rect, is_p = anim_helper(raw_r, f"OPT_{i}")
 
-        btn_options = []
-        btn_prev = pygame.Rect(0, 0, 0, 0)
-        btn_next = pygame.Rect(0, 0, 0, 0)
-        btn_submit = pygame.Rect(0, 0, 0, 0)
+            is_sel = (q.user_answer == i)
+            is_hov = raw_r.collidepoint(u_m, v_m)
+            if is_p:
+                bg_c, bd_c, bw = (200, 228, 255), (255, 200, 0), 3
+            elif is_sel:
+                bg_c, bd_c, bw = (218, 236, 255), (41, 128, 185), 3
+            elif is_hov:
+                bg_c, bd_c, bw = (238, 244, 252), (120, 165, 215), 2
+            else:
+                bg_c, bd_c, bw = (255, 255, 255), (200, 198, 190), 2
 
-        if paper_pts and len(paper_pts) >= 4:
-            xs = [p[0] for p in paper_pts]
-            ys = [p[1] for p in paper_pts]
-            min_x, max_x = min(xs), max(xs)
-            min_y, max_y = min(ys), max(ys)
-            pw = max_x - min_x
-            ph = max_y - min_y
+            pygame.draw.rect(self.paper_tex, bg_c, b_rect, border_radius=6)
+            pygame.draw.rect(self.paper_tex, bd_c, b_rect, bw, border_radius=6)
 
-            if pw > 160 and ph > 80:
-                pad_x = int(pw * 0.05)
-                content_x = min_x + pad_x
-                content_w = pw - pad_x * 2
-                curr_y = min_y + 5
+            opt_letter = ["A", "B", "C", "D"][i]
+            c_col = (41, 128, 185) if is_sel else (120, 120, 120)
+            pygame.draw.circle(self.paper_tex, c_col, (b_rect.x + 26, b_rect.centery), 15, 0 if is_sel else 2)
+            l_s = font_bold.render(opt_letter, True, (255, 255, 255) if is_sel else (60, 60, 60))
+            self.paper_tex.blit(l_s, (b_rect.x + 26 - l_s.get_width() // 2, b_rect.centery - l_s.get_height() // 2))
 
-                q = exam.current_question()
-                head_s = font_small.render(f"【書桌考卷】第 {exam.current_idx + 1} / {len(exam.questions)} 題", True, (41, 128, 185))
-                surface.blit(head_s, (content_x, curr_y + 3))
+            o_s = fopt.render(opt[3:], True, (20, 20, 20))
+            self.paper_tex.blit(o_s, (b_rect.x + 54, b_rect.centery - o_s.get_height() // 2))
 
-                # 將 < 上一題 / 下一題 > / 提早交卷 置於考卷右上角抬頭列，完全避免與下方抽屜重疊！
-                btn_prev = pygame.Rect(content_x + content_w - 280, curr_y, 82, 24)
-                btn_next = pygame.Rect(content_x + content_w - 192, curr_y, 82, 24)
-                btn_submit = pygame.Rect(content_x + content_w - 104, curr_y, 104, 24)
+    def render_player_desk_and_drawer(self, surface, exam, bio, mouse_pos, fonts, anim_helper):
+        """
+        繪製玩家正前方的 3D 書桌、平貼在書桌平面上的 3D 透視考卷、書桌下的立體抽屜、
+        以及「小抄在抽屜裡，打開小抄時會伸手拉開抽屜並打開小抄」的完整互動建模！
+        採用正確的 3D 上下層遮擋順序：
+        1. 先繪製書桌下方的抽屜箱體 (y=0.52~0.72)，關閉時自然被上方桌面遮擋
+        2. 繪製書桌桌面 (y=0.74~0.83 微傾桌面) 與平貼在桌面上的 3D 透視考卷
+        3. 當伸手拉開抽屜 (lift > 0) 時，繪製拉出桌面前緣的抽屜內部小抄與伸入抽屜的雙手
+        """
+        font_small, font_main, font_bold = fonts
+        lift = bio.emg_signal_level
 
-                for r_btn, lbl, en, b_n in [
-                    (btn_prev, "< 上一題", exam.current_idx > 0, "PREV"),
-                    (btn_next, "下一題 >", exam.current_idx < len(exam.questions) - 1, "NEXT"),
-                ]:
-                    d_b, is_p = anim_helper(r_btn, b_n)
-                    pygame.draw.rect(surface, (232, 238, 246) if en else (238, 238, 238), d_b, border_radius=4)
-                    pygame.draw.rect(surface, (255, 200, 0) if is_p else (180, 185, 195), d_b, 2 if is_p else 1, border_radius=4)
-                    ls = font_small.render(lbl, True, (30, 30, 30) if en else (165, 165, 165))
-                    surface.blit(ls, (d_b.centerx - ls.get_width() // 2, d_b.centery - ls.get_height() // 2))
-
-                sub_b, sub_p = anim_helper(btn_submit, "SUBMIT")
-                pygame.draw.rect(surface, (46, 204, 113), sub_b, border_radius=4)
-                pygame.draw.rect(surface, (255, 230, 80) if sub_p else (39, 174, 96), sub_b, 2 if sub_p else 1, border_radius=4)
-                ls_sub = font_small.render("★ 提早交卷", True, (255, 255, 255))
-                surface.blit(ls_sub, (sub_b.centerx - ls_sub.get_width() // 2, sub_b.centery - ls_sub.get_height() // 2))
-
-                curr_y += 27
-
-                lines = self._wrap_text(q.prompt, font_main, max(200, content_w - 8))
-                for ln in lines[:2]:
-                    ln_s = font_main.render(ln, True, (25, 25, 25))
-                    surface.blit(ln_s, (content_x, curr_y))
-                    curr_y += 21
-
-                opt_h = 26
-                opt_gap = 4
-                for i, opt in enumerate(q.options):
-                    raw_r = pygame.Rect(content_x, curr_y + i * (opt_h + opt_gap), content_w, opt_h)
-                    btn_options.append(raw_r)
-                    b_rect, is_p = anim_helper(raw_r, f"OPT_{i}")
-
-                    is_sel = (q.user_answer == i)
-                    is_hov = raw_r.collidepoint(mouse_pos)
-                    if is_p:
-                        bg_c, bd_c, bw = (205, 230, 255), (255, 200, 0), 3
-                    elif is_sel:
-                        bg_c, bd_c, bw = (220, 238, 255), (41, 128, 185), 3
-                    elif is_hov:
-                        bg_c, bd_c, bw = (242, 246, 252), (140, 175, 220), 2
-                    else:
-                        bg_c, bd_c, bw = (255, 255, 255), (210, 210, 205), 1
-
-                    pygame.draw.rect(surface, bg_c, b_rect, border_radius=4)
-                    pygame.draw.rect(surface, bd_c, b_rect, bw, border_radius=4)
-
-                    opt_letter = ["A", "B", "C", "D"][i]
-                    c_col = (41, 128, 185) if is_sel else (130, 130, 130)
-                    pygame.draw.circle(surface, c_col, (b_rect.x + 16, b_rect.centery), 10, 0 if is_sel else 2)
-                    l_s = font_small.render(opt_letter, True, (255, 255, 255) if is_sel else (70, 70, 70))
-                    surface.blit(l_s, (b_rect.x + 11, b_rect.centery - l_s.get_height() // 2))
-
-                    o_s = font_small.render(opt[3:], True, (30, 30, 30))
-                    surface.blit(o_s, (b_rect.x + 32, b_rect.centery - o_s.get_height() // 2))
-
-        # ==================== C. 書桌下方的立體抽屜建模與伸手翻小抄 (Drawer Under Desk) ====================
-        # 當打開小抄 (lift > 0) 時，抽屜從桌下 (z=0.35) 向玩家肚子的方向拉出至 (z=0.14)！
-        pull_z = lift * 0.21
+        # ==================== 1. 書桌下方的立體抽屜建模 (位於桌面下方 y=0.52~0.71) ====================
+        pull_z = lift * 0.24
         dr_x1, dr_x2 = -0.45, 0.45
-        dr_y_bot, dr_y_top = 0.56, 0.72
-        dr_z_front = 0.35 - pull_z
+        dr_y_bot, dr_y_top = 0.53, 0.70
+        dr_z_front = 0.34 - pull_z
         dr_z_back = 0.68 - pull_z
 
-        # 1. 抽屜內部深色木槽底板 (小抄就放在這個抽屜裡！)
         drawer_floor = [
             (dr_x1 + 0.02, dr_y_bot, dr_z_front),
             (dr_x2 - 0.02, dr_y_bot, dr_z_front),
             (dr_x2 - 0.02, dr_y_bot, dr_z_back),
             (dr_x1 + 0.02, dr_y_bot, dr_z_back),
         ]
-        df_floor_pts = self.draw_poly3d(surface, drawer_floor, (74, 52, 34), (48, 32, 20), 2)
+        self.draw_poly3d(surface, drawer_floor, (74, 52, 34), (48, 32, 20), 2)
 
-        # 2. 抽屜左右木側板
         self.draw_poly3d(surface, [(dr_x1, dr_y_bot, dr_z_front), (dr_x1, dr_y_bot, dr_z_back), (dr_x1, dr_y_top, dr_z_back), (dr_x1, dr_y_top, dr_z_front)], (118, 84, 54), (80, 55, 35), 2)
         self.draw_poly3d(surface, [(dr_x2, dr_y_bot, dr_z_front), (dr_x2, dr_y_bot, dr_z_back), (dr_x2, dr_y_top, dr_z_back), (dr_x2, dr_y_top, dr_z_front)], (118, 84, 54), (80, 55, 35), 2)
 
-        # 抽屜左側裡面的課本與鉛筆盒
+        # 抽屜內的藍色課本
         self.draw_poly3d(surface, [
-            (dr_x1 + 0.04, dr_y_bot + 0.01, dr_z_front + 0.03),
-            (dr_x1 + 0.16, dr_y_bot + 0.01, dr_z_front + 0.03),
-            (dr_x1 + 0.16, dr_y_bot + 0.01, dr_z_front + 0.22),
-            (dr_x1 + 0.04, dr_y_bot + 0.01, dr_z_front + 0.22),
+            (dr_x1 + 0.04, dr_y_bot + 0.01, dr_z_front + 0.02),
+            (dr_x1 + 0.16, dr_y_bot + 0.01, dr_z_front + 0.02),
+            (dr_x1 + 0.16, dr_y_bot + 0.01, dr_z_front + 0.18),
+            (dr_x1 + 0.04, dr_y_bot + 0.01, dr_z_front + 0.18),
         ], (55, 115, 165), (35, 80, 120), 1)
 
-        # 3. 抽屜前擋板與金屬拉把
         drawer_front = [
             (dr_x1, dr_y_bot - 0.02, dr_z_front),
             (dr_x2, dr_y_bot - 0.02, dr_z_front),
-            (dr_x2, dr_y_bot + 0.07, dr_z_front),
-            (dr_x1, dr_y_bot + 0.07, dr_z_front),
+            (dr_x2, dr_y_bot + 0.08, dr_z_front),
+            (dr_x1, dr_y_bot + 0.08, dr_z_front),
         ]
         df_pts = self.draw_poly3d(surface, drawer_front, (136, 96, 62), (88, 60, 38), 2)
         self.draw_poly3d(surface, [
-            (-0.08, dr_y_bot + 0.015, dr_z_front - 0.005),
-            ( 0.08, dr_y_bot + 0.015, dr_z_front - 0.005),
-            ( 0.08, dr_y_bot + 0.040, dr_z_front - 0.005),
-            (-0.08, dr_y_bot + 0.040, dr_z_front - 0.005),
+            (-0.08, dr_y_bot + 0.02, dr_z_front - 0.005),
+            ( 0.08, dr_y_bot + 0.02, dr_z_front - 0.005),
+            ( 0.08, dr_y_bot + 0.045, dr_z_front - 0.005),
+            (-0.08, dr_y_bot + 0.045, dr_z_front - 0.005),
         ], (218, 188, 105), (140, 115, 55), 1)
 
-        # 4. 抽屜裡的小抄與伸手打開小抄動畫
+        # ==================== 2. 書桌桌面建模 (Player's Desk Top, 微傾桌面讓閱讀更清晰) ====================
+        desk_x1, desk_x2 = -0.64, 0.64
+        desk_y_near = 0.71
+        desk_y_far = 0.89
+        desk_z_near = 0.35
+        desk_z_far = 1.00
+
+        # 書桌木質主桌面 (覆蓋在下方的抽屜上方，自然遮擋未拉出的抽屜後段)
+        self.draw_poly3d(surface, [
+            (desk_x1, desk_y_near, desk_z_near),
+            (desk_x2, desk_y_near, desk_z_near),
+            (desk_x2, desk_y_far, desk_z_far),
+            (desk_x1, desk_y_far, desk_z_far),
+        ], (196, 152, 106), (132, 96, 62), 3)
+
+        # 桌面立體前緣木條
+        self.draw_poly3d(surface, [
+            (desk_x1, desk_y_near - 0.03, desk_z_near),
+            (desk_x2, desk_y_near - 0.03, desk_z_near),
+            (desk_x2, desk_y_near, desk_z_near),
+            (desk_x1, desk_y_near, desk_z_near),
+        ], (152, 110, 72), (105, 74, 48), 2)
+
+        # 書桌右上角的原子筆與橡皮擦
+        self.draw_poly3d(surface, [
+            (0.47, desk_y_near + 0.02, 0.44),
+            (0.49, desk_y_near + 0.02, 0.44),
+            (0.53, desk_y_near + 0.08, 0.74),
+            (0.51, desk_y_near + 0.08, 0.74),
+        ], (45, 95, 185), (25, 55, 120), 1)
+        self.draw_poly3d(surface, [
+            (0.49, desk_y_near + 0.01, 0.37),
+            (0.56, desk_y_near + 0.01, 0.37),
+            (0.56, desk_y_near + 0.02, 0.42),
+            (0.49, desk_y_near + 0.02, 0.42),
+        ], (245, 245, 250), (160, 165, 175), 1)
+
+        # ==================== 3. 平貼在 3D 書桌平面上的考卷 (3D Planar Perspective Exam Sheet) ====================
+        paper_corners_3d = [
+            (-0.45, desk_y_far + 0.005, 0.96),   # Top-Left (Far-Left on desk plane)
+            ( 0.43, desk_y_far + 0.005, 0.96),   # Top-Right (Far-Right on desk plane)
+            ( 0.43, desk_y_near + 0.005, 0.37),  # Bottom-Right (Near-Right on desk plane)
+            (-0.45, desk_y_near + 0.005, 0.37),  # Bottom-Left (Near-Left on desk plane)
+        ]
+        proj_corners = [self.camera.project(pt) for pt in paper_corners_3d]
+
+        btn_options = [pygame.Rect(0, 0, 0, 0) for _ in range(4)]
+        btn_prev = pygame.Rect(0, 0, 0, 0)
+        btn_next = pygame.Rect(0, 0, 0, 0)
+        btn_submit = pygame.Rect(0, 0, 0, 0)
+
+        if all(c is not None for c in proj_corners):
+            pts_2d = [(c[0], c[1]) for c in proj_corners]
+            xs = [p[0] for p in pts_2d]
+            ys = [p[1] for p in pts_2d]
+            min_x, max_x = max(0, min(xs)), min(self.width, max(xs))
+            min_y, max_y = max(0, min(ys)), min(self.height, max(ys))
+            out_w = max_x - min_x
+            out_h = max_y - min_y
+
+            if out_w > 80 and out_h > 50:
+                dst_local = [(px - min_x, py - min_y) for (px, py) in pts_2d]
+                src_tex = [(0, 0), (self.TEX_W, 0), (self.TEX_W, self.TEX_H), (0, self.TEX_H)]
+                coeffs = find_perspective_coeffs(dst_local, src_tex)
+
+                if coeffs is not None:
+                    mx, my = mouse_pos
+                    u_m, v_m = map_point_with_coeffs(coeffs, mx - min_x, my - min_y)
+
+                    hit_rect = pygame.Rect(mx - 4, my - 4, 8, 8)
+                    if self.tex_btn_prev.collidepoint(u_m, v_m):
+                        btn_prev = hit_rect
+                    elif self.tex_btn_next.collidepoint(u_m, v_m):
+                        btn_next = hit_rect
+                    elif self.tex_btn_submit.collidepoint(u_m, v_m):
+                        btn_submit = hit_rect
+                    else:
+                        for idx, t_opt in enumerate(self.tex_btn_options):
+                            if t_opt.collidepoint(u_m, v_m):
+                                btn_options[idx] = hit_rect
+                                break
+
+                    self._render_exam_paper_texture(exam, (u_m, v_m), fonts, anim_helper)
+
+                    raw_bytes = pygame.image.tobytes(self.paper_tex, "RGBA")
+                    pil_img = Image.frombytes("RGBA", (self.TEX_W, self.TEX_H), raw_bytes)
+                    warped_pil = pil_img.transform(
+                        (out_w, out_h),
+                        Image.Transform.PERSPECTIVE,
+                        coeffs,
+                        Image.Resampling.BICUBIC,
+                    )
+                    warped_surf = pygame.image.frombytes(warped_pil.tobytes(), (out_w, out_h), "RGBA")
+                    surface.blit(warped_surf, (min_x, min_y))
+                    pygame.draw.polygon(surface, (175, 170, 160), pts_2d, 2)
+
+        # ==================== 4. 抽屜內的小抄與伸手拉開抽屜動畫 ====================
         if df_pts and len(df_pts) >= 4:
             d_xs = [p[0] for p in df_pts]
             d_ys = [p[1] for p in df_pts]
@@ -615,39 +686,35 @@ class Classroom3DRenderer:
             cy_mid = (min(d_ys) + max(d_ys)) // 2
 
             if lift <= 0.02:
-                # 抽屜關閉狀態：在抽屜縫隙露出一點點折疊的黃色小抄紙角
                 pygame.draw.polygon(surface, (242, 222, 130), [
-                    (cx_mid - 32, cy_mid - 14),
-                    (cx_mid + 32, cy_mid - 14),
-                    (cx_mid + 38, cy_mid - 4),
-                    (cx_mid - 38, cy_mid - 4),
+                    (cx_mid - 32, cy_mid - 10),
+                    (cx_mid + 32, cy_mid - 10),
+                    (cx_mid + 38, cy_mid - 2),
+                    (cx_mid - 38, cy_mid - 2),
                 ])
                 pygame.draw.polygon(surface, (180, 145, 55), [
-                    (cx_mid - 32, cy_mid - 14),
-                    (cx_mid + 32, cy_mid - 14),
-                    (cx_mid + 38, cy_mid - 4),
-                    (cx_mid - 38, cy_mid - 4),
+                    (cx_mid - 32, cy_mid - 10),
+                    (cx_mid + 32, cy_mid - 10),
+                    (cx_mid + 38, cy_mid - 2),
+                    (cx_mid - 38, cy_mid - 2),
                 ], 1)
                 hint_s = font_small.render("【書桌抽屜】小抄藏在抽屜裡 [按空白鍵 / 滑鼠右鍵 / 點EMG 伸手拉開抽屜打開小抄]", True, (255, 240, 175))
-                h_rect = pygame.Rect(cx_mid - hint_s.get_width() // 2 - 10, min(self.height - 30, cy_mid + 4), hint_s.get_width() + 20, 24)
+                h_rect = pygame.Rect(cx_mid - hint_s.get_width() // 2 - 10, min(self.height - 28, cy_mid + 2), hint_s.get_width() + 20, 24)
                 pygame.draw.rect(surface, (42, 30, 20), h_rect, border_radius=5)
                 pygame.draw.rect(surface, (215, 175, 85), h_rect, 1, border_radius=5)
                 surface.blit(hint_s, (h_rect.x + 10, h_rect.y + 3))
             else:
-                # 玩家伸手拉開抽屜並打開抽屜裡的小抄！
                 unfold = min(1.0, max(0.20, (lift - 0.08) / 0.92))
                 drawer_w = max(280, min(520, int((max(d_xs) - min(d_xs)) * 0.86)))
                 box_w = int(drawer_w * (0.65 + 0.35 * unfold))
                 box_h = int(115 * unfold + 20)
                 box_x = cx_mid - box_w // 2
-                box_y = max(self.height - 210, min(self.height - box_h - 14, cy_mid - box_h + 18))
+                box_y = max(self.height - 205, min(self.height - box_h - 14, cy_mid - box_h + 18))
 
-                # 繪製伸進抽屜裡的雙手與前臂 (Reaching Hands into Drawer)
                 skin_col = (242, 198, 168)
                 skin_dark = (212, 162, 132)
                 sleeve_col = (42, 56, 78)
 
-                # 左手：伸出握住抽屜邊緣並扶住小抄左側
                 lh_x = box_x + 24
                 lh_y = box_y + box_h - 14
                 pygame.draw.polygon(surface, sleeve_col, [
@@ -659,7 +726,6 @@ class Classroom3DRenderer:
                 pygame.draw.ellipse(surface, skin_col, (lh_x - 24, lh_y - 4, 48, 34))
                 pygame.draw.ellipse(surface, skin_dark, (lh_x - 14, lh_y - 12, 34, 20))
 
-                # 右手：伸入抽屜內將折疊的小抄往右拉開攤平
                 rh_x = box_x + int(box_w * (0.50 + 0.44 * unfold))
                 rh_y = box_y + box_h - 14
                 pygame.draw.polygon(surface, sleeve_col, [
@@ -671,13 +737,11 @@ class Classroom3DRenderer:
                 pygame.draw.ellipse(surface, skin_col, (rh_x - 24, rh_y - 4, 48, 34))
                 pygame.draw.ellipse(surface, skin_dark, (rh_x - 20, rh_y - 12, 34, 20))
 
-                # 繪製抽屜內展開的小抄紙張
                 cheat_surf = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
                 paper_alpha = int(min(255, lift * 255))
                 pygame.draw.rect(cheat_surf, (254, 249, 192, paper_alpha), (0, 0, box_w, box_h), border_radius=6)
                 pygame.draw.rect(cheat_surf, (195, 160, 65, paper_alpha), (0, 0, box_w, box_h), 2, border_radius=6)
 
-                # 小抄紙張中間的十字折痕
                 pygame.draw.line(cheat_surf, (220, 195, 120, int(paper_alpha * 0.6)), (box_w // 2, 4), (box_w // 2, box_h - 4), 1)
                 pygame.draw.line(cheat_surf, (220, 195, 120, int(paper_alpha * 0.6)), (8, box_h // 2), (box_w - 8, box_h // 2), 1)
 
@@ -702,7 +766,6 @@ class Classroom3DRenderer:
 
                 surface.blit(cheat_surf, (box_x, box_y))
 
-                # 繪製壓在小抄正面的左右手大拇指
                 pygame.draw.ellipse(surface, skin_col, (lh_x - 8, lh_y - 16, 20, 28))
                 pygame.draw.ellipse(surface, skin_col, (rh_x - 12, rh_y - 16, 20, 28))
 
