@@ -131,15 +131,15 @@ class TeacherAI:
     def get_status_description(self):
         """回傳目前奶龍監考官行為的描述，用於提示玩家"""
         if self.state == TeacherState.WRITING_BOARD:
-            return "🟡 奶龍正挺著大肚子在黑板寫板書（安全期！快看小抄！）", (40, 160, 40)
+            return "★ 奶龍正挺著大肚子在黑板寫板書（安全期！可伸手開抽屜看小抄！）", (46, 204, 113)
         elif self.state == TeacherState.BUZZER_WARNING:
-            return "【逼逼！警戒！】蜂鳴器響起！奶龍的大肚子開始抖動了！（可能在憋笑假動作）", (220, 140, 0)
+            return "【逼逼！警戒！】蜂鳴器響起！奶龍的大肚子開始抖動了！（可能在憋笑假動作）", (241, 196, 15)
         elif self.state == TeacherState.FALSE_ALARM:
-            return "🟡 奶龍只是轉身摸摸肚子抓癢，虛驚一場！", (120, 120, 40)
+            return "● 奶龍只是轉身摸摸肚子抓癢，虛驚一場！", (160, 200, 120)
         elif self.state == TeacherState.TURNING_AROUND:
-            return "【哈哈哈哈！】奶龍捧著大肚子轉身狂笑！眼神掃視全場！", (200, 50, 50)
+            return "【哈哈哈哈！】奶龍捧著大肚子轉身狂笑！眼神掃視全場！", (231, 76, 60)
         elif self.state == TeacherState.PATROLLING:
-            return "【極度危險】奶龍挺著大肚子巡查走道中！！千萬別開小抄！", (230, 20, 20)
+            return "【極度危險】奶龍挺著大肚子巡查走道中！！千萬別開抽屜看小抄！", (255, 60, 60)
         elif self.state == TeacherState.RETURNING:
-            return "奶龍巡查完畢，搖頭晃腦走回講台...", (100, 100, 150)
+            return "奶龍巡查完畢，搖頭晃腦走回講台...", (150, 180, 220)
         return "", (0, 0, 0)

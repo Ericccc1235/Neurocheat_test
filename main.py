@@ -224,12 +224,12 @@ def main():
                             ui.trigger_feedback(f"🔌 {status_msg}", color=(100, 200, 255), btn_name="PORT_CYCLE")
 
                 elif game_state == "PLAYING":
-                    if event.button == 3:  # 滑鼠右鍵點擊：直接切換小抄開/關
+                    if event.button == 3:  # 滑鼠右鍵點擊：直接切換伸手打開/收回抽屜小抄
                         bio_signals.toggle_emg()
                         if bio_signals.emg_active:
-                            ui.trigger_feedback("🖐️ 【滑鼠右鍵】小抄已拿在眼前！", color=(241, 196, 15), btn_name="EMG")
+                            ui.trigger_feedback("🖐️ 【滑鼠右鍵】已伸手拉開書桌抽屜並打開小抄！", color=(241, 196, 15), btn_name="EMG")
                         else:
-                            ui.trigger_feedback("📥 【滑鼠右鍵】小抄已收回！", color=(100, 200, 255), btn_name="EMG")
+                            ui.trigger_feedback("📥 【滑鼠右鍵】已將小抄合上並推回抽屜！", color=(100, 200, 255), btn_name="EMG")
 
                     elif event.button == 1:
                         # 0. 檢查模式切換按鈕
@@ -242,13 +242,13 @@ def main():
                             sound_mgr.play_click()
                             ui.trigger_feedback(f"🔌 {status_msg}", color=(100, 200, 255), btn_name="PORT_CYCLE")
 
-                        # 1. 檢查 EMG 按鈕 (點擊切換小抄拿在手上)
+                        # 1. 檢查 EMG 按鈕 (點擊切換伸手打開抽屜小抄)
                         elif ui.btn_emg.collidepoint(mouse_pos):
                             bio_signals.toggle_emg()
                             if bio_signals.emg_active:
-                                ui.trigger_feedback("🖐️ 【點擊螢幕按鈕】小抄已拿在眼前！", color=(241, 196, 15), btn_name="EMG")
+                                ui.trigger_feedback("🖐️ 【點擊按鈕】已伸手拉開書桌抽屜並展開小抄！", color=(241, 196, 15), btn_name="EMG")
                             else:
-                                ui.trigger_feedback("📥 【點擊螢幕按鈕】小抄已收回課桌！", color=(100, 200, 255), btn_name="EMG")
+                                ui.trigger_feedback("📥 【點擊按鈕】已將小抄合上並推回抽屜！", color=(100, 200, 255), btn_name="EMG")
 
                         # 2. 檢查心率上下微調按鈕
                         elif ui.btn_ecg_up.collidepoint(mouse_pos):
@@ -345,22 +345,23 @@ def main():
             if space_down_now and not prev_space_down:
                 bio_signals.toggle_emg()
                 if bio_signals.emg_active:
-                    ui.trigger_feedback("🖐️ 【空白鍵】已將小抄拿在眼前！", color=(241, 196, 15), btn_name="EMG")
+                    ui.trigger_feedback("🖐️ 【空白鍵】已伸手拉開抽屜並打開小抄！", color=(241, 196, 15), btn_name="EMG")
                 else:
-                    ui.trigger_feedback("📥 【空白鍵】已將小抄收回課桌底！", color=(100, 200, 255), btn_name="EMG")
+                    ui.trigger_feedback("📥 【空白鍵】已將小抄收回書桌抽屜！", color=(100, 200, 255), btn_name="EMG")
 
             if c_down_now and not prev_c_down:
                 bio_signals.toggle_emg()
                 if bio_signals.emg_active:
-                    ui.trigger_feedback("🖐️ 【C鍵】小抄拿在眼前！", color=(241, 196, 15), btn_name="EMG")
+                    ui.trigger_feedback("🖐️ 【C鍵】已伸手拉開抽屜並打開小抄！", color=(241, 196, 15), btn_name="EMG")
                 else:
-                    ui.trigger_feedback("📥 【C鍵】小抄已收回！", color=(100, 200, 255), btn_name="EMG")
+                    ui.trigger_feedback("📥 【C鍵】已將小抄收回書桌抽屜！", color=(100, 200, 255), btn_name="EMG")
 
         prev_space_down = space_down_now
         prev_c_down = c_down_now
 
-        # ---------------- 2. 遊戲邏輯更新 ----------------
+        # ---------------- 2. 遊戲邏輯與 3D 滑鼠視角更新 ----------------
         if game_state == "PLAYING":
+            ui.update_camera(mouse_pos, dt)
             exam_mgr.time_left -= dt
             if exam_mgr.time_left <= 0:
                 exam_mgr.time_left = 0
@@ -389,11 +390,10 @@ def main():
             ui.render_title_screen(mouse_pos, bio=bio_signals, hw_bridge=hw_bridge)
         else:
             screen.fill(ui.COLOR_BG)
-            ui.render_classroom_scene(teacher, bio_signals)
+            # 渲染完整 3D 教室、旁邊其他學生、奶龍監考官、書桌考卷與抽屜小抄伸手動畫
+            ui.render_3d_classroom_world(teacher, exam_mgr, bio_signals, mouse_pos)
             ui.render_header(exam_mgr, bio=bio_signals)
-            ui.render_exam_sheet(exam_mgr, mouse_pos)
             ui.render_bio_dashboard(bio_signals, mouse_pos, hw_bridge=hw_bridge)
-            ui.render_cheat_sheet(exam_mgr, bio_signals)
 
             if game_state == "BUSTED":
                 ui.render_game_over(reason="BUSTED", score=exam_mgr.calculate_score(), records=data_logger.records)
