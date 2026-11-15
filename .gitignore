@@ -6,3 +6,6 @@ venv/
 ENV/
 .DS_Store
 external_signals.json
+sessions/
+*.csv
+bio_analysis_report.png
