@@ -68,7 +68,7 @@ python main.py
 
 | 項目 | 建議保留 / 新增 | 建議刪除或改以數位處理 (`exp2_dsp.py`) |
 | :--- | :--- | :--- |
-| **前端差動與電氣安全** | **保留** AD620 + 電氣隔離（行動電源供電 + HC-05 藍牙）+ **建議新增 RLD 右腿驅動**（或穩壓偏置 + 2.5V Vref Buffer） | 原本 **類比 60Hz Fliege Notch**（對電容誤差與溫漂敏感，且阻帶不夠穩）→ 改由 Python `iirnotch(60Hz, Q=30)` 精準濾除 |
+| **前端差動與電氣安全** | **保留** AD620 + 電氣隔離（行動電源供電 + **HM-10 BLE** / HC-05）+ **建議新增 RLD 右腿驅動**（或穩壓偏置 + 2.5V Vref Buffer） | 原本 **類比 60Hz Fliege Notch**（對電容誤差與溫漂敏感，且阻帶不夠穩）→ 改由 Python `iirnotch(60Hz, Q=30)` 精準濾除 |
 | **EMG 前級** | **保留** 20–500Hz 帶通 + 整流包絡（或讓 `neurocheat_exp2_dual.ino` 在 Arduino 內以 1kHz 採樣 A1 取包絡後傳送，避開 200Hz 取樣混疊與 `9600 baud` 瓶頸！）| 原本 **10µF 大電容 0.1Hz 高通**（動作干擾恢復慢 $\tau=10\text{s}$）→ 改為 `1µF` (`~1.6Hz`) 或直接交由數位 `0.5-40Hz` `sosfilt` 帶通處理 |
 | **反折疊 / LPF** | **保留** 固定 ~50~70Hz 一階 RC LPF 當硬體抗混疊保護 | 可省略 Arduino 外接分壓或過度多級類比調增益（並將總增益調低避免 `0~5V` 截波飽和） |
 | **硬體雙向回饋** | **可新增** Pin 8 主動式蜂鳴器 / 震動馬達（與遊戲老師警告同步響）+ Pin 4 微動測試按鈕 | — |
@@ -99,8 +99,12 @@ python main.py
    # 例：Exp 3 受試者重播 + Exp 2 原版單通道 ECG 藍牙實機 (COM4 @ 9600)
    .venv\Scripts\python.exe -m bio_bridge.bridge_hub --eeg replay --sub S01 --arduino-mode exp2_raw --bio-com COM4 --bio-baud 9600
 
-   # 例：全實機雙系統 (BrainLink COM3 + 新版雙通道 Arduino COM5)
-   .venv\Scripts\python.exe -m bio_bridge.bridge_hub --eeg live --eeg-com COM3 --arduino-mode dual --bio-com COM5 --bio-baud 9600
+   # 例：掃描並連線 HM-10 BLE（無須 COM Port！--ble-test 可免貼電極測封包）
+   .venv\Scripts\python.exe -m bio_bridge.bridge_hub --scan-ble
+   .venv\Scripts\python.exe -m bio_bridge.bridge_hub --eeg sim --arduino-mode ble --ble-test
+
+   # 例：全實機雙系統 (BrainLink COM3 + HM-10 BLE Arduino)
+   .venv\Scripts\python.exe -m bio_bridge.bridge_hub --eeg live --eeg-com COM3 --arduino-mode ble
    ```
 2. 再啟動 **`run_game.bat`**（或 `python main.py`），按 **`F1`** 切至 `EXTERNAL`，點擊「15 秒基線校正後開考」即可遊玩。
 3. 遊戲結束後會自動產出 `sessions/neurocheat_session_data.csv` 與四聯分析圖 `sessions/bio_analysis_report.png`。

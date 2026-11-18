@@ -13,7 +13,7 @@ Neurocheat_test/
 ├── main.py                              # 主程式與狀態機 (TITLE -> CALIBRATION -> PLAYING -> REPORT)
 ├── run_game.bat                         # 一鍵啟動遊戲（自動偵測 .venv）
 ├── run_bridge.bat                       # 硬體／模擬／重播訊號橋接器選單
-├── requirements.txt                     # 團隊統一套件需求 (pygame/numpy/scipy/scikit-learn/pyserial/pillow/pandas/matplotlib)
+├── requirements.txt                     # 團隊統一套件需求 (pygame/numpy/scipy/scikit-learn/pyserial/bleak/pillow/pandas/matplotlib)
 ├── .gitignore                           # 排除 .venv/、sessions/、*.csv、bio_analysis_report.png 等個人執行產物
 ├── README.md                            # 專案總說明、硬體對照表與啟動方式
 ├── CHANGELOG.md                         # 本次改動總整理（本文件）
@@ -53,7 +53,8 @@ Neurocheat_test/
 ## 2. 實驗二（Exp 2 ECG + EMG）整合與硬體簡化
 
 * **新版雙通道韌體 ([neurocheat_exp2_dual.ino](file:///D:/biomedical_final/Neurocheat_test/firmware/neurocheat_exp2_dual/neurocheat_exp2_dual.ino))**：
-  * `A0` 採樣 ECG（`160Hz`，10-bit），`A1` 在 Arduino 內以 **`1000Hz` 採樣並計算 EMG 包絡線**，避免 `200Hz` 取樣對 20–500Hz EMG 產生混疊（Aliasing），打包為 3-byte 自我同步二進位封包（每秒 480 bytes，可穩定跑在 HC-05 `9600 baud` 與 USB `115200 baud`）。
+  * `A0` 採樣 ECG（`160Hz`，10-bit），`A1` 在 Arduino 內以 **`1000Hz` 採樣並計算 EMG 包絡線**，避免 `200Hz` 取樣對 20–500Hz EMG 產生混疊（Aliasing），打包為 3-byte 自我同步二進位封包（每秒 480 bytes，可穩定跑在 **HM-10 BLE / HC-05 `9600 baud`** 與 USB `115200 baud`）。
+  * 新增過濾 HM-10 連線提示字串（如 `"OK+CONN"`）保護機制，防止誤觸發 `'C'` 長鳴，並於 `bridge_hub.py` 加入 `--arduino-mode ble`、`--scan-ble` 與 `--ble-test` 免貼電極測試模式（透過 `bleak` 直接對接 HM-10 `0xFFE1`）。
   * 支援選配 Pin `4` 實體微動按鈕（不貼電極時按住模擬用力握拳）與 Pin `8` 有源蜂鳴器／震動馬達（接收遊戲傳回的 `'B'`／`'C'` 指令同步發出警告或抓包音）。
   * 內建 `'T'` 指令切換模擬測試波，無電極也可測試整條藍牙／Serial 鏈路。
 * **保留原版單通道相容 ([arduino_ecg_bluetooth.ino](file:///D:/biomedical_final/Neurocheat_test/firmware/neurocheat_exp2_raw_compat/arduino_ecg_bluetooth.ino))**：

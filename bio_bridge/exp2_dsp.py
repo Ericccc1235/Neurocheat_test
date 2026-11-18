@@ -89,8 +89,14 @@ class RealtimeECGProcessor:
         self.bpm_base = 72.0
         self.base_calibrated = False
         self._calib_bpms = []
+        self._outlier_streak = 0
         self.bpm_delta = 0.0
         self.quality = "ok"
+        self.bad_reason = ""
+        self.rail_frac = 0.0
+        self.last_ptp = 0.0
+        self.raw_v_min = 2.5
+        self.raw_v_max = 2.5
         self.last_beat_time = time.time()
 
     def set_baseline_bpm(self, bpm_base):
@@ -163,18 +169,29 @@ class RealtimeECGProcessor:
                         rr = (cur_idx - self.last_peak_idx) / self.fs
                         if 0.33 <= rr <= 1.80:  # 33 ~ 181 BPM
                             inst_bpm = 60.0 / rr
-                            # 抗單點極端異常值門控
+                            # 抗單點極端異常值門控（連續 2 次同節律則解鎖切換，避免被初始錯值永久鎖死）
                             if not self.rr_hist or abs(inst_bpm - self.bpm) < 35.0:
+                                self._outlier_streak = 0
                                 self.rr_hist.append(rr)
                                 med_rr = float(np.median(self.rr_hist))
                                 smooth_bpm = 60.0 / med_rr
                                 self.bpm = 0.72 * self.bpm + 0.28 * smooth_bpm
                                 self._calib_bpms.append(self.bpm)
+                                self.last_beat_time = now_time
                                 if not self.base_calibrated and len(self._calib_bpms) >= 6:
                                     self.bpm_base = float(np.median(self._calib_bpms[:12]))
                                     self.base_calibrated = True
+                            else:
+                                self._outlier_streak += 1
+                                if self._outlier_streak >= 2:
+                                    self._outlier_streak = 0
+                                    self.rr_hist.clear()
+                                    self.rr_hist.append(rr)
+                                    self.bpm = inst_bpm
+                                    self.last_beat_time = now_time
+                    else:
+                        self.last_beat_time = now_time
                     self.last_peak_idx = cur_idx
-                    self.last_beat_time = now_time
             prev_v = val
 
         self.sample_idx += n
@@ -183,13 +200,27 @@ class RealtimeECGProcessor:
         raw_arr = np.asarray(self.raw_buf, dtype=np.float64)
         rail_frac = float(np.mean((raw_arr <= 4.0) | (raw_arr >= self.adc_max - 4.0)))
         ptp = float(np.ptp(win[-int(self.fs):]))
+        self.rail_frac = rail_frac
+        self.last_ptp = ptp
+        self.raw_v_min = float(np.min(raw_arr)) / self.adc_max * 5.0
+        self.raw_v_max = float(np.max(raw_arr)) / self.adc_max * 5.0
+        no_beat_s = now_time - self.last_beat_time
 
-        if rail_frac > 0.15 or ptp < 0.025 or (now_time - self.last_beat_time) > 3.8:
+        if rail_frac > 0.15:
             self.quality = "bad"
+            self.bad_reason = f"削頂飽和 rail={rail_frac*100:.0f}%, A0={self.raw_v_min:.2f}~{self.raw_v_max:.2f}V"
+        elif ptp < 0.025:
+            self.quality = "bad"
+            self.bad_reason = f"平線過小 ptp={ptp:.3f}, A0={self.raw_v_min:.2f}~{self.raw_v_max:.2f}V"
+        elif no_beat_s > 3.8:
+            self.quality = "bad"
+            self.bad_reason = f"逾{no_beat_s:.1f}s無合格R波, A0={self.raw_v_min:.2f}~{self.raw_v_max:.2f}V, ptp={ptp:.3f}"
         elif mad > 0.32 * peak_amp and peak_amp > 0.1:
             self.quality = "noisy"
+            self.bad_reason = f"雜訊偏高 A0={self.raw_v_min:.2f}~{self.raw_v_max:.2f}V"
         else:
             self.quality = "ok"
+            self.bad_reason = ""
 
         self.bpm_delta = float(self.bpm - self.bpm_base)
 

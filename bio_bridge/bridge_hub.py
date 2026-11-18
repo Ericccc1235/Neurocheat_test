@@ -21,6 +21,7 @@ bridge_hub.py - NeuroCheat 多通道生醫訊號融合橋接中心
 """
 
 import argparse
+import asyncio
 import json
 import math
 import os
@@ -49,6 +50,72 @@ from bio_bridge.exp2_dsp import (
 UDP_IP = "127.0.0.1"
 UDP_DATA_PORT = 5005
 UDP_CMD_PORT = 5006
+
+# HM-10 (CC2541) 與常見 BLE UART 透傳模組預設名稱與 GATT UUID
+HM10_NAME_HINTS = ("hmsoft", "hm-10", "hm10", "bt05", "mlt-bt05", "dsd", "jdy", "cc41")
+BLE_NOTIFY_UUIDS = (
+    "0000ffe1-0000-1000-8000-00805f9b34fb",
+    "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+)
+BLE_WRITE_UUIDS = (
+    "0000ffe1-0000-1000-8000-00805f9b34fb",
+    "0000ffe2-0000-1000-8000-00805f9b34fb",
+    "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+)
+
+
+def _is_probable_hm10(name, adv_uuids):
+    low_name = (name or "").lower()
+    if any(hint in low_name for hint in HM10_NAME_HINTS):
+        return True
+    for u in adv_uuids or ():
+        if "ffe0" in str(u).lower() or "6e400001" in str(u).lower():
+            return True
+    return False
+
+
+def scan_ble_devices(timeout=5.0):
+    """掃描附近 BLE 裝置並標示疑似 HM-10 模組，方便組員確認電腦是否找得到模組。"""
+    try:
+        from bleak import BleakScanner
+    except ImportError:
+        print("[BLE] 尚未安裝 bleak，請先執行: .venv\\Scripts\\python.exe -m pip install bleak")
+        return []
+
+    print(f"[BLE 掃描] 正在搜尋鄰近低功耗藍牙裝置 ({timeout:.0f} 秒)...")
+
+    async def _scan():
+        return await BleakScanner.discover(timeout=timeout, return_adv=True)
+
+    try:
+        results = asyncio.run(_scan())
+    except Exception as e:
+        print(f"[BLE 掃描失敗] 請確認筆電藍牙已開啟: {e}")
+        return []
+
+    items = []
+    for _addr, (dev, adv) in results.items():
+        name = dev.name or adv.local_name or "(未命名)"
+        rssi = adv.rssi if adv.rssi is not None else -999
+        uuids = list(adv.service_uuids or [])
+        items.append((rssi, dev.address, name, uuids, _is_probable_hm10(name, uuids)))
+
+    items.sort(reverse=True, key=lambda x: x[0])
+    print("\n=== 掃描到的 BLE 裝置清單 ===")
+    if not items:
+        print("  (找不到任何 BLE 裝置。請確認 HM-10 電源已開、LED 正在閃爍、且筆電藍牙已開啟)")
+    else:
+        for idx, (rssi, addr, name, uuids, is_hm10) in enumerate(items, start=1):
+            tag = " [★ 疑似 HM-10]" if is_hm10 else ""
+            u_str = ", ".join(str(u)[:8] for u in uuids[:3])
+            print(f"  {idx:2d}. {name:<20s} | MAC={addr} | RSSI={rssi:4d} dBm | UUID={u_str}{tag}")
+
+        best = next((it for it in items if it[4]), None)
+        if best:
+            print(f"\n建議連線測試指令 (MAC={best[1]}):")
+            print(f"  .venv\\Scripts\\python.exe -m bio_bridge.bridge_hub --eeg sim --arduino-mode ble --ble-addr {best[1]} --ble-test")
+    print("=" * 34)
+    return items
 
 
 def find_dataset_dir():
@@ -121,8 +188,12 @@ class BridgeHub:
             "emg": 0.0,
             "emg_fist": False,
         }
+        self._last_emg_raw = 0.0
 
         self.bio_serial = None
+        self._ble_active = False
+        self._ble_tx_lock = threading.Lock()
+        self._ble_tx_deque = deque()
         self.calib_phase = None  # None | "REST" | "MVC" | "FOCUS"
         self._pending_blink = False
         self._pending_double_blink = False
@@ -162,6 +233,9 @@ class BridgeHub:
                 self.bio_serial.write(b_cmd)
             except Exception:
                 pass
+        if self._ble_active:
+            with self._ble_tx_lock:
+                self._ble_tx_deque.append(b_cmd)
 
     def _poll_commands(self):
         try:
@@ -246,21 +320,37 @@ class BridgeHub:
         except Exception as e:
             print(f"[EEG Live] 開啟 {self.args.eeg_com} 失敗: {e}")
             return
+        print(f"[EEG Live] {self.args.eeg_com} 序列埠已開啟，等待 ThinkGear 腦波資料...")
 
         tg = ThinkGearStreamDecoder()
         raw_buf = []
         ascii_buf = bytearray()
+        t0_eeg = time.time()
+        got_first_sample = False
+        warned_no_eeg = False
 
         while self.running:
             try:
                 waiting = ser.in_waiting
                 data = ser.read(waiting if waiting > 0 else 1)
                 if not data:
+                    if (not got_first_sample) and (not warned_no_eeg) and (time.time() - t0_eeg >= 4.5):
+                        warned_no_eeg = True
+                        print(
+                            f"[EEG Live 提示] 開啟 {self.args.eeg_com} 後 4.5 秒內未收到資料："
+                            "請確認選到「連出 (Outgoing)」COM Port、頭環已長按開機，且未開著 115-1_brainlink.exe 佔用藍牙！"
+                        )
                     continue
 
                 samples = tg.feed(data)
                 if samples:
                     raw_buf.extend(samples)
+                    if not got_first_sample:
+                        got_first_sample = True
+                        print(
+                            f"[EEG Live] 成功收到 BrainLink 512Hz 腦波串流！"
+                            f"(poor_signal={tg.poor_signal}；0=貼合正常，>50=請壓緊額頭乾電極)"
+                        )
                 elif tg.packet_ok_count == 0:
                     # 若從未見 ThinkGear binary 封包，支援文字格式 fallback
                     ascii_buf.extend(data)
@@ -269,6 +359,9 @@ class BridgeHub:
                         try:
                             val = float(line_b.decode("utf-8", errors="ignore").strip().split(",")[0])
                             raw_buf.append(val)
+                            if not got_first_sample:
+                                got_first_sample = True
+                                print("[EEG Live] 成功收到 BrainLink 文字格式串流！")
                         except ValueError:
                             pass
 
@@ -320,12 +413,42 @@ class BridgeHub:
         mode = self.args.arduino_mode
         if mode == "none":
             return
-        if mode in ("dual", "exp2_raw") and self.args.bio_com:
+        if mode == "ble":
+            self._run_ble_live()
+        elif mode in ("dual", "exp2_raw") and self.args.bio_com:
             self._run_arduino_live(mode)
         else:
             if mode in ("dual", "exp2_raw") and not self.args.bio_com:
                 print("[Exp2] 未指定 --bio-com，改用合成 ECG+EMG 模擬串流 (sim)")
             self._run_bio_sim()
+
+    def _flush_bio_batches(self, batch_ecg, batch_emg, last_btn, now_t):
+        """共用的即時 ECG/EMG 數位濾波、個人校正與狀態更新，供 Serial 與 BLE 共用。"""
+        bpm, bpm_d, qual, wave_chunk = self.ecg_proc.process_samples(batch_ecg, now_t)
+        batch_ecg.clear()
+
+        emg_norm = self.bio_state["emg"]
+        emg_fist = self.bio_state["emg_fist"]
+        if batch_emg:
+            raw_emg = float(np.mean(batch_emg))
+            batch_emg.clear()
+            self._last_emg_raw = raw_emg
+            if self.calib_phase == "REST":
+                self.emg_proc.record_rest(raw_emg)
+            elif self.calib_phase == "MVC":
+                self.emg_proc.record_mvc(raw_emg)
+            emg_norm, emg_fist = self.emg_proc.process(raw_emg, btn_override=last_btn)
+
+        with self.lock:
+            self.bio_state["ecg_bpm"] = bpm
+            self.bio_state["bpm_base"] = round(self.ecg_proc.bpm_base, 1)
+            self.bio_state["bpm_delta"] = bpm_d
+            self.bio_state["ecg_quality"] = qual
+            self.bio_state["ecg_samples"].extend(wave_chunk)
+            if len(self.bio_state["ecg_samples"]) > 120:
+                self.bio_state["ecg_samples"] = self.bio_state["ecg_samples"][-120:]
+            self.bio_state["emg"] = emg_norm
+            self.bio_state["emg_fist"] = emg_fist
 
     def _run_arduino_live(self, mode):
         try:
@@ -361,8 +484,7 @@ class BridgeHub:
                 data = self.bio_serial.read(waiting if waiting > 0 else 1)
                 if data:
                     if mode == "dual":
-                        frames = decoder.feed(data)
-                        for ecg10, emg8, _test_mode, btn in frames:
+                        for ecg10, emg8, _test_mode, btn in decoder.feed(data):
                             batch_ecg.append(ecg10)
                             batch_emg.append(emg8)
                             last_btn = btn
@@ -374,32 +496,210 @@ class BridgeHub:
                 now_t = time.time()
                 if batch_ecg and (now_t - last_flush >= 0.04 or len(batch_ecg) >= 12):
                     last_flush = now_t
-                    bpm, bpm_d, qual, wave_chunk = self.ecg_proc.process_samples(batch_ecg, now_t)
-                    batch_ecg.clear()
-
-                    emg_norm = self.bio_state["emg"]
-                    emg_fist = self.bio_state["emg_fist"]
-                    if batch_emg:
-                        raw_emg = float(np.mean(batch_emg))
-                        batch_emg.clear()
-                        if self.calib_phase == "REST":
-                            self.emg_proc.record_rest(raw_emg)
-                        elif self.calib_phase == "MVC":
-                            self.emg_proc.record_mvc(raw_emg)
-                        emg_norm, emg_fist = self.emg_proc.process(raw_emg, btn_override=last_btn)
-
-                    with self.lock:
-                        self.bio_state["ecg_bpm"] = bpm
-                        self.bio_state["bpm_base"] = round(self.ecg_proc.bpm_base, 1)
-                        self.bio_state["bpm_delta"] = bpm_d
-                        self.bio_state["ecg_quality"] = qual
-                        self.bio_state["ecg_samples"].extend(wave_chunk)
-                        if len(self.bio_state["ecg_samples"]) > 120:
-                            self.bio_state["ecg_samples"] = self.bio_state["ecg_samples"][-120:]
-                        self.bio_state["emg"] = emg_norm
-                        self.bio_state["emg_fist"] = emg_fist
+                    self._flush_bio_batches(batch_ecg, batch_emg, last_btn, now_t)
             except Exception:
                 time.sleep(0.02)
+
+    def _resolve_ble_chars(self, client):
+        """從連線後的 GATT 服務中找出 HM-10/BLE UART 通知 (RX) 與寫入 (TX) Characteristic。"""
+        custom_uuid = (self.args.ble_uuid or "").strip().lower()
+        notify_cands = []
+        write_cands = []
+        for svc in client.services:
+            for ch in svc.characteristics:
+                u = str(ch.uuid).lower()
+                props = set(ch.properties or ())
+                if custom_uuid and custom_uuid in u:
+                    if "notify" in props or "indicate" in props:
+                        notify_cands.insert(0, (0, ch))
+                    if "write-without-response" in props or "write" in props:
+                        write_cands.insert(0, (0, ch))
+                if "notify" in props or "indicate" in props:
+                    prio = BLE_NOTIFY_UUIDS.index(u) + 1 if u in BLE_NOTIFY_UUIDS else 99
+                    notify_cands.append((prio, ch))
+                if "write-without-response" in props or "write" in props:
+                    prio = BLE_WRITE_UUIDS.index(u) + 1 if u in BLE_WRITE_UUIDS else 99
+                    write_cands.append((prio, ch))
+        notify_cands.sort(key=lambda x: x[0])
+        write_cands.sort(key=lambda x: x[0])
+        rx_char = notify_cands[0][1] if notify_cands else None
+        tx_char = write_cands[0][1] if write_cands else None
+        return rx_char, tx_char
+
+    def _run_ble_live(self):
+        try:
+            from bleak import BleakClient, BleakScanner
+        except ImportError:
+            print("[BLE] 尚未安裝 bleak，請執行: .venv\\Scripts\\python.exe -m pip install bleak")
+            return
+
+        async def _ble_session():
+            target_addr = (self.args.ble_addr or "").strip()
+            target_name = (self.args.ble_name or "").strip().lower()
+            decoder = DualBinaryFrameDecoder()
+            batch_ecg = []
+            batch_emg = []
+            state_box = {"btn": False, "first_frame": False, "disconnected": False}
+            rx_buf = bytearray()
+            rx_lock = threading.Lock()
+
+            while self.running:
+                device = None
+                if target_addr:
+                    print(f"[BLE] 正在尋找指定裝置 MAC={target_addr} ...")
+                    device = await BleakScanner.find_device_by_address(target_addr, timeout=6.0)
+                else:
+                    print("[BLE] 掃描鄰近低功耗藍牙裝置 (最多 6 秒)...")
+                    found = await BleakScanner.discover(timeout=6.0, return_adv=True)
+                    candidates = []
+                    for _a, (dev, adv) in found.items():
+                        dname = dev.name or adv.local_name or ""
+                        rssi = adv.rssi if adv.rssi is not None else -999
+                        uuids = list(adv.service_uuids or [])
+                        if target_name:
+                            matched = target_name in dname.lower()
+                        else:
+                            matched = _is_probable_hm10(dname, uuids)
+                        if matched:
+                            candidates.append((rssi, dev, dname or dev.address))
+                    if candidates:
+                        candidates.sort(reverse=True, key=lambda x: x[0])
+                        _rssi, device, picked_label = candidates[0]
+                        print(f"[BLE] 鎖定目標: {picked_label} (MAC={device.address}, RSSI={_rssi} dBm)")
+                    elif found:
+                        print("[BLE] 未比對到 HM-10 (HMSoft/FFE0)，鄰近發現的裝置有：")
+                        for _a, (dev, adv) in found.items():
+                            dname = dev.name or adv.local_name or "(未命名)"
+                            print(f"      - {dname} (MAC={dev.address}, RSSI={adv.rssi})")
+                        print("[BLE] 提示: 可直接加上 --ble-addr <MAC> 或 --ble-name <名稱>；若 HM-10 燈已恆亮代表正被手機/Windows 佔用連線！")
+
+                if device is None:
+                    if not self.running:
+                        break
+                    print("[BLE] 找不到目標裝置，3 秒後重試...")
+                    await asyncio.sleep(3.0)
+                    continue
+
+                state_box["disconnected"] = False
+                state_box["first_frame"] = False
+                state_box["raw_rx_bytes"] = 0
+                state_box["first_raw_logged"] = False
+
+                def _on_disconnect(_client):
+                    state_box["disconnected"] = True
+                    print("[BLE] 警告: HM-10 藍牙連線已中斷，將自動重連...")
+
+                def _on_notify(_sender, data):
+                    with rx_lock:
+                        rx_buf.extend(data)
+
+                try:
+                    async with BleakClient(device, disconnected_callback=_on_disconnect, timeout=12.0) as client:
+                        rx_char, tx_char = self._resolve_ble_chars(client)
+                        if rx_char is None:
+                            print("[BLE] 找不到支援 Notify 的 GATT 特徵值，請確認這顆裝置為 HM-10 透傳模組！")
+                            await asyncio.sleep(3.0)
+                            continue
+
+                        with self._ble_tx_lock:
+                            self._ble_tx_deque.clear()
+                        self._ble_active = True
+
+                        await client.start_notify(rx_char, _on_notify)
+                        print(
+                            f"[BLE] 已連線！(若模組 LED 轉為恆亮代表成功) RX={str(rx_char.uuid)[:8]} | "
+                            f"TX={str(tx_char.uuid)[:8] if tx_char else '無'}，等待 Arduino 封包..."
+                        )
+
+                        # 送出啟動串流指令 ('S')，若使用者傳入 --ble-test 則同步切入 Arduino 測試波 ('T')
+                        if tx_char is not None:
+                            use_resp = "write-without-response" not in set(tx_char.properties or ())
+                            await client.write_gatt_char(tx_char, b"S", response=use_resp)
+                            if self.args.ble_test:
+                                await asyncio.sleep(0.08)
+                                await client.write_gatt_char(tx_char, b"T", response=use_resp)
+                                print("[BLE] 已發送 'T' 指令切換至 Arduino 內建測試波 (75 BPM + EMG 週期測試)！")
+
+                        conn_t0 = time.time()
+                        warned_no_rx = False
+                        last_flush = conn_t0
+                        while self.running and not state_box["disconnected"]:
+                            # 傳送遊戲端回饋指令 ('B' 警告 / 'C' 抓包 / 'T' 測試波 / 'P' 暫停)
+                            pending_cmds = []
+                            with self._ble_tx_lock:
+                                while self._ble_tx_deque:
+                                    pending_cmds.append(self._ble_tx_deque.popleft())
+                            for cmd_b in pending_cmds:
+                                if tx_char is not None:
+                                    use_resp = "write-without-response" not in set(tx_char.properties or ())
+                                    try:
+                                        await client.write_gatt_char(tx_char, cmd_b, response=use_resp)
+                                    except Exception:
+                                        pass
+
+                            chunk = b""
+                            with rx_lock:
+                                if rx_buf:
+                                    chunk = bytes(rx_buf)
+                                    rx_buf.clear()
+
+                            if chunk:
+                                state_box["raw_rx_bytes"] += len(chunk)
+                                if not state_box["first_raw_logged"]:
+                                    state_box["first_raw_logged"] = True
+                                    print(
+                                        f"[BLE Debug] 收到原始 BLE 資料 {len(chunk)} bytes "
+                                        f"(前幾碼 hex={chunk[:8].hex(' ')})，嘗試解碼 3-byte 封包..."
+                                    )
+                                frames = decoder.feed(chunk)
+                                if frames and not state_box["first_frame"]:
+                                    state_box["first_frame"] = True
+                                    print("[BLE] 成功收到首筆 3-byte 封包！HM-10 雙通道串流已完全打通！")
+                                for ecg10, emg8, _tm, btn in frames:
+                                    batch_ecg.append(ecg10)
+                                    batch_emg.append(emg8)
+                                    state_box["btn"] = btn
+
+                            now_t = time.time()
+                            if (not state_box["first_frame"]) and (not warned_no_rx) and (now_t - conn_t0 >= 4.0):
+                                warned_no_rx = True
+                                if state_box["raw_rx_bytes"] == 0:
+                                    print(
+                                        "[BLE 提示] 筆電已連上 HM-10，但收到 0 bytes："
+                                        "請確認是否已燒錄 neurocheat_exp2_dual.ino、HM-10 RXD<-Pin 3、TXD->Pin 2 與共地 GND！"
+                                    )
+                                else:
+                                    print(
+                                        f"[BLE 提示] 收到 {state_box['raw_rx_bytes']} bytes 原始資料但無法解成 3-byte 雙通道封包："
+                                        "請確認已燒錄最新版 neurocheat_exp2_dual.ino 且 Arduino BT_BAUD 與 HM-10 Baudrate 一致 (預設 9600)！"
+                                    )
+                            if batch_ecg and (now_t - last_flush >= 0.04 or len(batch_ecg) >= 12):
+                                last_flush = now_t
+                                self._flush_bio_batches(batch_ecg, batch_emg, state_box["btn"], now_t)
+
+                            await asyncio.sleep(0.015)
+
+                        try:
+                            if tx_char is not None and not state_box["disconnected"]:
+                                use_resp = "write-without-response" not in set(tx_char.properties or ())
+                                await client.write_gatt_char(tx_char, b"P", response=use_resp)
+                            await client.stop_notify(rx_char)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"[BLE] 連線過程發生異常: {e}")
+                finally:
+                    self._ble_active = False
+                    with self._ble_tx_lock:
+                        self._ble_tx_deque.clear()
+
+                if self.running:
+                    await asyncio.sleep(2.0)
+
+        try:
+            asyncio.run(_ble_session())
+        except Exception as e:
+            print(f"[BLE] 事件迴圈錯誤: {e}")
 
     def _run_bio_sim(self):
         print("[Exp2 Sim] 啟動合成 ECG (真實數位 R-peak 濾波演算法驗證) + 漸進 EMG 模擬")
@@ -492,13 +792,28 @@ class BridgeHub:
 
                 self.tx_sock.sendto(json.dumps(packet).encode("utf-8"), (UDP_IP, UDP_DATA_PORT))
 
-                if t_now - last_print >= 2.0:
+                emg_only = bool(getattr(self.args, "emg_only", False))
+                print_interval = 0.4 if emg_only else 2.0
+                if t_now - last_print >= print_interval:
                     last_print = t_now
-                    print(
-                        f"[{t_now:5.1f}s] ECG={packet['ecg_bpm']:.1f}bpm (Δ{packet['bpm_delta']:+.1f},{packet['ecg_quality']}) | "
-                        f"EMG={packet['emg']:.2f}({packet['emg_fist']}) | "
-                        f"Focus={packet['focus']:.0f}% Stroop={packet['stroop']:.0f}%"
-                    )
+                    if emg_only:
+                        bar_n = int(round(packet["emg"] * 20))
+                        bar = "#" * bar_n + "-" * (20 - bar_n)
+                        print(
+                            f"[{t_now:5.1f}s] EMG={packet['emg']:.2f} [{bar}] "
+                            f"握拳={str(packet['emg_fist']):<5s} | A1包絡raw={self._last_emg_raw:5.1f}/255 "
+                            f"(Rest={self.emg_proc.rest_level:.0f}, MVC={self.emg_proc.mvc_level:.0f})"
+                        )
+                    else:
+                        qual_txt = packet["ecg_quality"]
+                        if qual_txt != "ok" and self.ecg_proc.bad_reason:
+                            qual_txt = f"{qual_txt}: {self.ecg_proc.bad_reason}"
+                        eeg_q = "" if packet["eeg_quality"] == "ok" else f",{packet['eeg_quality']}"
+                        print(
+                            f"[{t_now:5.1f}s] ECG={packet['ecg_bpm']:.1f}bpm (Δ{packet['bpm_delta']:+.1f},{qual_txt}) | "
+                            f"EMG={packet['emg']:.2f}({packet['emg_fist']},raw={self._last_emg_raw:.0f}) | "
+                            f"Focus={packet['focus']:.0f}% Stroop={packet['stroop']:.0f}%{eeg_q}"
+                        )
 
                 time.sleep(0.04)  # 25 Hz 推送頻率
         except KeyboardInterrupt:
@@ -516,11 +831,21 @@ def main():
     parser.add_argument("--sub", default="_GLOBAL_", help="EEG 模型 (_GLOBAL_ 或 S01~S21)")
     parser.add_argument("--eeg-com", default="COM3", help="BrainLink 藍牙 COM Port")
     parser.add_argument("--eeg-baud", type=int, default=57600, help="BrainLink Baudrate (標準 ThinkGear 為 57600)")
-    parser.add_argument("--arduino-mode", choices=["dual", "exp2_raw", "sim", "none"], default="sim", help="Arduino 模式")
+    parser.add_argument("--arduino-mode", choices=["dual", "ble", "exp2_raw", "sim", "none"], default="sim", help="Arduino 模式 (ble=HM-10低功耗藍牙)")
     parser.add_argument("--bio-com", default=None, help="Arduino / HC-05 COM Port (例如 COM4)")
     parser.add_argument("--bio-baud", type=int, default=9600, help="Arduino/HC-05 Baudrate (HC-05 預設 9600, USB 115200)")
+    parser.add_argument("--ble-name", default="", help="HM-10/BLE 裝置名稱關鍵字 (留空自動比對 HMSoft/HM-10/FFE0)")
+    parser.add_argument("--ble-addr", default=None, help="直接指定 HM-10 BLE MAC 位址 (例如 AA:BB:CC:DD:EE:FF)")
+    parser.add_argument("--ble-uuid", default=None, help="選配自訂 BLE UART 特徵 UUID (預設自動偵測 FFE1)")
+    parser.add_argument("--ble-test", action="store_true", help="HM-10 連線後自動送 'T' 開啟 Arduino 假波形測試 (免貼電極驗收)")
+    parser.add_argument("--scan-ble", action="store_true", help="掃描並列出附近 BLE/HM-10 裝置後結束")
+    parser.add_argument("--emg-only", action="store_true", help="單測 EMG 模式：每 0.4s 僅顯示 A1 原始包絡線與握拳進度條")
     parser.add_argument("--cmd-port", type=int, default=UDP_CMD_PORT, help="接收遊戲回饋指令的 UDP Port")
     args = parser.parse_args()
+
+    if args.scan_ble:
+        scan_ble_devices(timeout=5.0)
+        return
 
     hub = BridgeHub(args)
     hub.run()
